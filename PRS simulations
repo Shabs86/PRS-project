@@ -1,0 +1,108 @@
+These scripts explain how we constructed the polygenic risk scores and performed the simulations
+
+#####################
+
+Polygenic risk scores. For each of body mass index, height, HDL \& LDL cholesterol and triglyceride, we computed five PRS 
+(one classical and four Bayesian) using the results from the 24 Summary GWAS, then measured how well each of these predicted for the eMERGE data. 
+To avoid strand issue, we reduced to non-ambiguous SNPs. 
+To calculate a Bayesian PRS, we first compute a tagging file (either 1-part or multi-part), then the prior distribution 
+for the heritability tagged by each SNP, and finally the posterior mean effect sizes. We found that the Bayesian PRS 
+benefited from clumping, but not the Classical PRS. 
+
+Here we demonstrate for height, using results from the most recent GIANT Consortium meta-analysis.\cite{defining} 
+Suppose the eMERGE data are stored in \verb|eMERGE.bed|, \verb|eMERGE.bim| and \verb|eMERGE.fam|, and the 
+corresponding phenotypes are in \verb|height.pheno|. 
+
+We will save results in a folder called \verb|prs|.
+
+
+#Identify the non-ambiguous eMERGE SNPs
+awk < eMERGE.bim '(($5=="A"&&$6=="C") || ($5=="A"&&$6=="G") || ($5=="C"&&$6=="T") || \
+($5=="C"&&$6=="A") ||($5=="G"&&$6=="A") || ($5=="T"&&$6=="C")){print $2}' > eMERGE.nonamb
+
+#Format the summary statistics for height - now per-SNP sample sizes are provided
+wget https://portals.broadinstitute.org/collaboration/giant/images/0/01/\
+GIANT_HEIGHT_Wood_et_al_2014_publicrelease_HapMapCeuFreq.txt.gz
+gunzip -c GIANT_HEIGHT_Wood_et_al_2014_publicrelease_HapMapCeuFreq.txt.gz | awk '(NR>1){snp=$1;a1=$2;a2=$3;\
+dir=$5;p=$7;n=$8}(NR==1){print "Predictor A1 A2 Direction P n"}(NR>1 && (a1=="A"||a1=="C"||a1=="G"||a1=="T") \
+&& (a2=="A"||a2=="C"||a2=="G"||a2=="T")){print snp, a1, a2, dir, p, n}' - > height.txt
+
+#Check for duplicates (there are none)
+awk < height.txt '{print $1}' | sort | uniq -d | head
+
+#Each PRS scorefile should have the columns Predictor, A1, A2, Centre (can set to NA) and Effect
+
+#For the classical PRS, the effect size of each SNP is its correlation, equal to ssign(direction)*(stat/(stat+n)^.5
+awk < height.txt '(NR==1){print "Predictor A1 A2 Centre Effect"}(NR>1){r=sqrt($5/($5+$6));\
+if($4<0){r=-r};print $1, $2, $3, "NA", r}' >> prs/height_class.score
+
+#To calculate the two LDAK Bayesian PRS, we must first calculate LDAK weights
+for j in {1..22}; do
+./ldak5.linux --cut-weights height_chr$j --bfile ref --extract height.txt --chr $j
+./ldak5.linux --calc-weights-all height_chr$j --bfile ref --extract height.txt --chr $j
+done
+cat height_chr{1..22}/weights.short > height.weights
+
+#Now compute 1-part and 25-part tagfiles; use --reduce NO to ensure they contain all SNPs
+./ldak5.linux --calc-tagging height_ldak.non --bfile ref --extract height.txt --weights height.weights \
+--power -.25 --window-cm 1 --reduce NO
+./ldak5.linux --calc-tagging height_ldak.ann.non --bfile ref --extract height.txt --weights height.weights \
+--power -.25 --window-cm 1 --annotation-number 24 --annotation-prefix ann_snps. --reduce NO
+
+#Compute the expected heritability tagged by each SNP
+#For this we must provide an estimate of SNP heritability (we recommend using the estimates from --sum-her)
+#For the enriched LDAK PRS, we must also provide the heritability fractions computed above
+her=`grep Her_ALL height_ldak.non.hers | awk '{print $2}'`
+./ldak5.linux --calc-exps prs/height_ldak.non --tagfile height_ldak.non.tagging --her $her
+her=`grep Her_ALL height_ldak.ann.non.hers | awk '{print $2}'`
+./ldak5.linux --calc-exps prs/height_ldak.ann.non --tagfile height_ldak.ann.non.tagging --her $her \
+--props props.ldak
+
+#Next we compute the posterior means (again watch screen output; will likely have to add --check-sums NO)
+./ldak5.linux --calc-posts prs/height_ldak.non --expectations prs/height_ldak.non.exps --summary height.txt
+./ldak5.linux --calc-posts prs/height_ldak.ann.non --expectations prs/height_ldak.ann.non.exps --summary height.txt
+
+#Finally, we clump; we add --extract eMERGE.nonamb, as we will only be using these when predicting
+#Normally to clump we provide pvalues; here we instead provide .psuedos files (which rank SNPs by Bayes factors)
+./ldak5.linux --thin prs/height_ldak.non --bfile ref --extract eMERGE.nonamb --window-cm 1 --window-prune .1 \
+--pvalues prs/height_ldak.non.psuedos
+./ldak5.linux --thin prs/height_ldak.ann.non --bfile ref --extract eMERGE.nonamb --window-cm 1 --window-prune .1 \
+--pvalues prs/height_ldak.ann.non.psuedos
+
+#To test each PRS, we project onto the eMERGE data; at this step, it is convenient to provide the phenotypes
+#All PRS contain standardized effect sizes, so we use --power -1 (for raw effect sizes, use --power 0)
+#Having excluded ambiguous, it should be OK to allow flips; likely a few SNPs will have inconsistent alleles
+./ldak5.linux --calc-scores prs/height_class --bfile eMERGE --extract eMERGE.nonamb \
+--scorefile prs/height_class.score --pheno height.pheno --power -1 --allow-flips YES --allow-inconsistent YES
+./ldak5.linux --calc-scores prs/height_ldak.non --bfile eMERGE --extract prs/height_ldak.non.in \
+--scorefile prs/height_ldak.non.score --pheno height.pheno --power -1 --allow-flips YES --allow-inconsistent YES
+./ldak5.linux --calc-scores prs/height_ldak.ann.non --bfile eMERGE --extract prs/height_ldak.ann.non.in \
+--scorefile prs/height_ldak.ann.non.score --pheno height.pheno --power -1 --allow-flips YES --allow-inconsistent YES
+
+#Predictions are stored in prs/height_class.profile, prs/height_ldak.non.profile and prs/height_ldak.ann.non.profile
+#We measured performance by calculating rho, the correlation between predicted and observed phenotypes
+#We estimated the SD of rho by block-jackknifing 500 times for each PRS; for each jackknife we computed rho_z
+#the correlation across 99.8% of individuals, then the estimate of the SD of rho is SD(rho_z)*499^.5
+
+#####################
+
+Additional scripts. 
+Our previous paper\cite{speedeval} provided scripts for estimating inflation 
+due to confounding via REML and for performing association analysis, 
+including how to construct covariates (when performing linear regression, we included sex and ten principal components; 
+five derived from the reference panel, five from the 1000 Genomes Project\cite{1000g}). 
+
+To simulate phenotypes under the GCTA and LDAK Models, we used the following scripts 
+(these assume the Wellcome Trust control individuals\cite{wellcome} are stored in 
+\verb|wt.bed|, \verb|wt.bim| and \verb|wt.fam|).
+
+
+#Simulating 500 phenotypes (each with SNP heritability 0.5 and 2000 causal SNPs)
+./ldak5.linux --make-phenos gcta --bfile wt --ignore-weights YES --power -1 --num-causals 2000 --num-phenos 500
+./ldak5.linux --make-phenos ldak --bfile wt --weights ref.weights --power -.25 --num-causals 2000 --num-phenos 500
+
+#Simulating 250 pairs of phenotypes (consecutive pairs have genetic correlation 0.5)
+./ldak5.linux --make-phenos gcta_bivar --bfile wt --ignore-weights YES --power -1 --num-causals 2000 \
+--num-phenos 500 --bivar .5
+./ldak5.linux --make-phenos ldak_bivar --bfile wt --weights ref.weights --power -.25 --num-causals 2000 \
+--num-phenos 500 --bivar .5
